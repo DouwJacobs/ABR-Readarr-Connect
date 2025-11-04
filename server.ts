@@ -1,10 +1,15 @@
 // server.ts
 import express, { Request, Response } from "express";
 import ReadarrAPI, { ReadarrBookOptions } from "./api/readarr-api"; // your API class
+import { insertRequest, updateRequestFailure, updateRequestSuccess, getRequests, getRequestById, markRequestPending } from "./lib/db";
+import path from "path";
 import logger from "./logger";
 
 const app = express();
 app.use(express.json());
+// Serve static frontend
+app.use(express.static(path.join(__dirname, "public")));
+app.use(express.static(path.join(__dirname, "../client/dist")));
 
 interface WebhookBody {
   bookTitle: string;
@@ -42,6 +47,13 @@ app.post("/webhook/readarr", async (req: Request, res: Response) => {
       return res.status(400).json({ error: "Invalid or missing 'bookAuthors'" });
     }
 
+    // Insert request log (pending)
+    const requestId = insertRequest({
+      bookTitle,
+      bookAuthors,
+      requestBody: req.body,
+    });
+
     // Search by free-text query combining title and authors
     const term = `${bookTitle} ${bookAuthors}`.trim();
     const candidates = await readarr.searchBooks(term);
@@ -73,6 +85,14 @@ app.post("/webhook/readarr", async (req: Request, res: Response) => {
 
     const addedBook = await readarr.addBook(options);
 
+    // Update request log (success)
+    updateRequestSuccess(requestId, {
+      addedBookId: addedBook.id,
+      addedBookTitle: addedBook.title,
+      monitored: addedBook.monitored,
+      response: addedBook,
+    });
+
     res.json({
       success: true,
       message: `Book "${addedBook.title}" added/monitored successfully`,
@@ -86,6 +106,86 @@ app.post("/webhook/readarr", async (req: Request, res: Response) => {
     const message = err instanceof Error ? err.message : String(err);
     const stack = err instanceof Error ? err.stack : undefined;
     logger.error("Webhook processing failed", { errorMessage: message, stack });
+    try {
+      const { bookTitle, bookAuthors } = req.body as Partial<WebhookBody>;
+      if (bookTitle && bookAuthors) {
+        // Best-effort: insert or update failure
+        try {
+          const requestId = insertRequest({ bookTitle, bookAuthors, requestBody: req.body });
+          updateRequestFailure(requestId, message);
+        } catch {}
+      }
+    } catch {}
+    res.status(500).json({ success: false, error: message });
+  }
+});
+
+// ====== API: List requests ======
+app.get("/api/requests", (req: Request, res: Response) => {
+  try {
+    const rows = getRequests();
+    res.json({ success: true, data: rows });
+  } catch (e) {
+    const message = e instanceof Error ? e.message : String(e);
+    res.status(500).json({ success: false, error: message });
+  }
+});
+
+// ====== API: Retry request ======
+app.post("/api/requests/:id/retry", async (req: Request, res: Response) => {
+  const id = Number(req.params.id);
+  const row = getRequestById(id);
+  if (!row) return res.status(404).json({ success: false, error: "Not found" });
+  try {
+    markRequestPending(id);
+    const parsed = JSON.parse(row.requestBody ?? "{}");
+    const bookTitle = parsed.bookTitle ?? row.bookTitle;
+    const bookAuthors = parsed.bookAuthors ?? row.bookAuthors;
+    const term = `${bookTitle} ${bookAuthors}`.trim();
+    const candidates = await readarr.searchBooks(term);
+    const candidate = candidates[0];
+    if (!candidate) throw new Error("Book not found from title/author search");
+    const hcId = Number((candidate as any)?.book.foreignBookId);
+    const authorHcId = Number((candidate as any)?.book.author?.foreignAuthorId);
+    if (!Number.isFinite(hcId) || !Number.isFinite(authorHcId)) {
+      throw new Error("Unable to derive identifiers required to add the book");
+    }
+    const options: ReadarrBookOptions = {
+      title: bookTitle,
+      hcId,
+      authorHcId,
+      rootFolderPath: ROOT_FOLDER_PATH,
+      qualityProfileId: QUALITY_PROFILE_ID,
+      metadataProfileId: METADATA_PROFILE_ID,
+      tags: [],
+      profileId: 0,
+      searchNow: READARR_SEARCH_ON_ADD,
+    };
+    const addedBook = await readarr.addBook(options);
+    updateRequestSuccess(id, {
+      addedBookId: addedBook.id,
+      addedBookTitle: addedBook.title,
+      monitored: addedBook.monitored,
+      response: addedBook,
+    });
+    res.json({ success: true, data: addedBook });
+  } catch (e) {
+    const message = e instanceof Error ? e.message : String(e);
+    updateRequestFailure(id, message);
+    res.status(500).json({ success: false, error: message });
+  }
+});
+
+// ====== API: Remove from Readarr ======
+app.post("/api/requests/:id/remove", async (req: Request, res: Response) => {
+  const id = Number(req.params.id);
+  const row = getRequestById(id);
+  if (!row || !row.addedBookId) return res.status(404).json({ success: false, error: "No added book to remove" });
+  try {
+    await readarr.removeBook(row.addedBookId);
+    res.json({ success: true });
+  } catch (e) {
+    const message = e instanceof Error ? e.message : String(e);
     res.status(500).json({ success: false, error: message });
   }
 });
